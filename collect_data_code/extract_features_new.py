@@ -3,38 +3,47 @@ import os
 import pandas as pd
 from pathlib import Path
 
+# 10 minutes expressed in milliseconds — used as the early-game cutoff throughout
 TEN_MIN_MS = 10 * 60 * 1000
 
 
 def get_jungle_side(x: int, y: int) -> int:
+    # The map diagonal runs roughly along x+y=15000.
+    # Camps below that line belong to blue side (100), above to red side (200).
     return 100 if (x + y) < 15000 else 200
 
-
 def extract_features(filepath: str) -> dict:
+    # Load the pre-processed match JSON produced by the crawler
     with open(filepath, 'r', encoding='utf-8') as f:
         data = json.load(f)
 
     frames = data['timeline']['info']['frames']
     players = data['players']
+    # Build a participantId → stats dict for O(1) lookup later
     stats_10min_raw = {s['participantId']: s for s in data['stats_10min']}
 
+    # Guard: a valid 5v5 match must have exactly 10 participants
     participants = [p for p in players if p['participantId'] <= 10]
     if len(participants) != 10:
-        raise ValueError(f"参与者数量异常: {len(participants)}人，跳过")
+        raise ValueError(f"Unexpected participant count: {len(participants)}, skipping")
 
+    # Convenience lookup tables used throughout this function
     pid_to_team     = {p['participantId']: p['teamId']              for p in participants}
     pid_to_champ    = {p['participantId']: p['championName']         for p in participants}
     pid_to_position = {p['participantId']: p.get('teamPosition', '') for p in participants}
 
+    # Start the feature dict with the match label and identifier
     features = {
         'win':     int(data['win']),
         'matchId': data['matchId'],
     }
 
-    # ══════════════════════════════════════════════
-    # 1. 每分钟增量特征（金币/经验/补刀/承伤）— 前10分钟
-    # ══════════════════════════════════════════════
+    # Per-minute delta features (gold / xp / cs / damage taken) — first 10 minutes
+    # We compute how much each resource changed between consecutive timeline frames,
+    # then normalise by the time elapsed to get a per-minute rate.
+
     prev_frame = None
+    # One list per resource per participant; we'll average them at the end
     deltas_by_pid = {
         pid: {'gold': [], 'xp': [], 'cs': [], 'damage_taken': []}
         for pid in pid_to_team
@@ -43,6 +52,7 @@ def extract_features(filepath: str) -> dict:
     for frame in frames:
         if frame['timestamp'] > TEN_MIN_MS:
             break
+        # The very first frame has no predecessor, so skip it and store as baseline
         if frame['timestamp'] < 60000:
             prev_frame = frame
             continue
@@ -54,6 +64,7 @@ def extract_features(filepath: str) -> dict:
             if pid not in pid_to_team:
                 continue
             if prev_pf and pid_str in prev_pf:
+                # dt is the gap between this frame and the previous one, in minutes
                 dt = (frame['timestamp'] - prev_frame['timestamp']) / 60000
                 if dt > 0:
                     deltas_by_pid[pid]['gold'].append(
@@ -64,6 +75,8 @@ def extract_features(filepath: str) -> dict:
                         (pdata['minionsKilled'] + pdata['jungleMinionsKilled']
                          - prev_pf[pid_str]['minionsKilled']
                          - prev_pf[pid_str]['jungleMinionsKilled']) / dt)
+                    # Damage taken may be stored inside a nested 'damageStats' dict
+                    # or as a top-level field depending on the API version; handle both
                     dmg_now  = (pdata.get('damageStats', {}).get('totalDamageTaken')
                                 or pdata.get('totalDamageTaken', 0))
                     dmg_prev = (prev_pf[pid_str].get('damageStats', {}).get('totalDamageTaken')
@@ -71,6 +84,7 @@ def extract_features(filepath: str) -> dict:
                     deltas_by_pid[pid]['damage_taken'].append((dmg_now - dmg_prev) / dt)
         prev_frame = frame
 
+    # Average the per-minute deltas and combine with the raw 10-min snapshot values
     for pid, team in pid_to_team.items():
         d = deltas_by_pid.get(pid, {})
         s = stats_10min_raw.get(pid, {})
@@ -89,17 +103,18 @@ def extract_features(filepath: str) -> dict:
         features[f'p{pid}_assists_10min']     = s.get('assists', 0)
         features[f'p{pid}_damage_10min']      = s.get('damage_dealt', 0)
 
-    # ══════════════════════════════════════════════
-    # 2. 队伍事件 + 野怪分布
-    # ══════════════════════════════════════════════
+    # team-level events + jungle monster distribution
+    # Walk the timeline events to count kills, deaths, first blood, and
+    # elite monster kills split by own-jungle vs invaded-jungle.
+
     kills_by_pid  = {pid: 0 for pid in pid_to_team}
     deaths_by_pid = {pid: 0 for pid in pid_to_team}
 
     kills_100, kills_200 = 0, 0
-    first_blood_team = None
+    first_blood_team = None  # will be set to 100 or 200 when first blood fires
 
-    jungle_own_100   = 0
-    jungle_enemy_100 = 0
+    jungle_own_100   = 0  # blue side kills a camp on their own side
+    jungle_enemy_100 = 0  # blue side invades and kills a red-side camp
     jungle_own_200   = 0
     jungle_enemy_200 = 0
 
@@ -123,15 +138,18 @@ def extract_features(filepath: str) -> dict:
                     kills_200 += 1
 
             elif etype == 'CHAMPION_SPECIAL_KILL':
+                # KILL_FIRST_BLOOD fires once per game; record which team got it
                 if event.get('killType') == 'KILL_FIRST_BLOOD':
                     killer_id = event.get('killerId', 0)
                     first_blood_team = pid_to_team.get(killer_id, 0)
 
             elif etype == 'ELITE_MONSTER_KILL':
                 killer_id   = event.get('killerId', 0)
+                # killerTeamId is used as fallback when the killer is not a champion (e.g. turret kill)
                 killer_team = pid_to_team.get(killer_id, event.get('killerTeamId', 0))
                 pos = event.get('position', {})
                 x, y = pos.get('x', 7500), pos.get('y', 7500)
+                # Compare the camp's map side to the killer's team side to detect invasions
                 monster_side = get_jungle_side(x, y)
                 if killer_team == 100:
                     if monster_side == 100:
@@ -144,7 +162,7 @@ def extract_features(filepath: str) -> dict:
                     else:
                         jungle_enemy_200 += 1
 
-    # 队伍击杀汇总
+    # Aggregate individual counts into team-level kill/death features
     features['team100_kills_10min']  = sum(kills_by_pid[p] for p, t in pid_to_team.items() if t == 100)
     features['team200_kills_10min']  = sum(kills_by_pid[p] for p, t in pid_to_team.items() if t == 200)
     features['team100_deaths_10min'] = sum(deaths_by_pid[p] for p, t in pid_to_team.items() if t == 100)
@@ -153,18 +171,20 @@ def extract_features(filepath: str) -> dict:
     features['kills_100']            = kills_100
     features['kills_200']            = kills_200
     features['kill_diff']            = kills_100 - kills_200
+    # Binary flag: 1 if blue side got first blood, 0 otherwise
     features['first_blood_team100']  = int(first_blood_team == 100) if first_blood_team else 0
 
-    # 野怪分布
+    # Jungle control features: own camps secured vs. enemy camps invaded
     features['jungle_own_100']     = jungle_own_100
     features['jungle_enemy_100']   = jungle_enemy_100
     features['jungle_own_200']     = jungle_own_200
     features['jungle_enemy_200']   = jungle_enemy_200
+    # Positive value means blue side invaded more; negative means red side invaded more
     features['jungle_invade_diff'] = jungle_enemy_100 - jungle_enemy_200
 
-    # ══════════════════════════════════════════════
-    # 3. 第10分钟末金币/经验差
-    # ══════════════════════════════════════════════
+    # Team gold / XP totals and differential at the 10-minute mark 
+    # Use the last frame that falls within the cutoff to get a clean end-of-window snapshot.
+
     last_frame_pf = None
     for frame in frames:
         if frame['timestamp'] <= TEN_MIN_MS:
@@ -194,30 +214,33 @@ def extract_features(filepath: str) -> dict:
 
     return features
 
-
 def build_dataset(match_data_dir: str) -> pd.DataFrame:
+    """
+    Iterate over all JSON files in match_data_dir, extract features from each,
+    and return the results as a single pandas DataFrame.
+    Files that raise an exception are skipped and reported at the end.
+    """
     rows = []
     errors = []
     path = Path(match_data_dir)
     files = list(path.glob('*.json'))
-    print(f"找到 {len(files)} 个比赛文件")
+    print(f"Found {len(files)} match files")
 
     for i, fp in enumerate(files):
         try:
             row = extract_features(str(fp))
             rows.append(row)
             if (i + 1) % 100 == 0:
-                print(f"已处理 {i+1}/{len(files)}")
+                print(f"Processed {i+1}/{len(files)}")
         except Exception as e:
             errors.append(fp.name)
-            print(f"✗ 跳过 {fp.name}: {e}")
+            print(f"Skipping {fp.name}: {e}")
 
     df = pd.DataFrame(rows)
-    print(f"\n✓ 数据集构建完成: {len(df)} 场比赛, {len(df.columns)} 个特征")
+    print(f"\nDataset built: {len(df)} matches, {len(df.columns)} features")
     if errors:
-        print(f"⚠ 跳过了 {len(errors)} 个文件: {', '.join(errors)}")
+        print(f"Skipped {len(errors)} file(s): {', '.join(errors)}")
     return df
-
 
 if __name__ == "__main__":
     base = os.path.dirname(os.path.abspath(__file__))
@@ -226,5 +249,4 @@ if __name__ == "__main__":
 
     output_path = os.path.join(base, "match_data_emerald1.csv")
     df.to_csv(output_path, index=False, encoding='utf-8-sig')
-    print(f"✓ 特征文件已保存到: {output_path}")
-    print(df.head())
+    print(f"Feature file saved to: {output_path}")
